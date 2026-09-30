@@ -142,8 +142,9 @@ class Settings:
     # Gemini API (Google AI Studio key)
     google_api_key: str
 
-    # Embeddings (Gemini API)
-    embedding_model: str = "models/text-embedding-004"
+    # Embeddings (Gemini API). The Google AI API exposes embeddings under
+    # 'models/gemini-embedding-001' (v1beta); 'text-embedding-*' are Vertex-only.
+    embedding_model: str = "models/gemini-embedding-001"
 
     # Generation (Gemini API)
     llm_model: str = "gemini-2.0-flash-lite"

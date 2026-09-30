@@ -145,7 +145,7 @@ _SECURED_VIEWS = (
 )
 
 
-def build_secured_cte() -> str:
+def build_secured_cte(available_tables: Optional[set] = None) -> str:
     """Return the WITH clause that scopes all data to the current user.
 
     Every downstream query can only reference the ``my_*`` views produced
@@ -154,39 +154,34 @@ def build_secured_cte() -> str:
     SQL, not in the prompt.
     """
 
-    return (
-        "WITH my_requests AS (\n"
+    # Child views: (view_name, base_table). Each is scoped to the user's own
+    # requests via package_request_id. my_requests is always the anchor.
+    child_specs = [
+        ("my_costs", "package_request_costs"),
+        ("my_passengers", "package_request_passengers"),
+        ("my_visas", "visa_applications"),
+        ("my_flights", "flight_bookings"),
+        ("my_hotels", "hotel_bookings"),
+        ("my_transport", "transport_bookings"),
+        ("my_attractions", "attraction_bookings"),
+    ]
+
+    ctes = [
+        "my_requests AS (\n"
         "    SELECT * FROM package_requests WHERE user_id = :current_user_id\n"
-        "),\n"
-        "my_costs AS (\n"
-        "    SELECT c.* FROM package_request_costs c\n"
-        "    JOIN my_requests r ON c.package_request_id = r.id\n"
-        "),\n"
-        "my_passengers AS (\n"
-        "    SELECT p.* FROM package_request_passengers p\n"
-        "    JOIN my_requests r ON p.package_request_id = r.id\n"
-        "),\n"
-        "my_visas AS (\n"
-        "    SELECT v.* FROM visa_applications v\n"
-        "    JOIN my_requests r ON v.package_request_id = r.id\n"
-        "),\n"
-        "my_flights AS (\n"
-        "    SELECT f.* FROM flight_bookings f\n"
-        "    JOIN my_requests r ON f.package_request_id = r.id\n"
-        "),\n"
-        "my_hotels AS (\n"
-        "    SELECT h.* FROM hotel_bookings h\n"
-        "    JOIN my_requests r ON h.package_request_id = r.id\n"
-        "),\n"
-        "my_transport AS (\n"
-        "    SELECT t.* FROM transport_bookings t\n"
-        "    JOIN my_requests r ON t.package_request_id = r.id\n"
-        "),\n"
-        "my_attractions AS (\n"
-        "    SELECT a.* FROM attraction_bookings a\n"
-        "    JOIN my_requests r ON a.package_request_id = r.id\n"
         ")"
-    )
+    ]
+    for view_name, base_table in child_specs:
+        if available_tables is not None and base_table not in available_tables:
+            continue
+        ctes.append(
+            f"{view_name} AS (\n"
+            f"    SELECT x.* FROM {base_table} x\n"
+            "    JOIN my_requests r ON x.package_request_id = r.id\n"
+            ")"
+        )
+
+    return "WITH " + ",\n".join(ctes)
 
 
 def build_user_schema_description(db_engine: Engine) -> str:
@@ -212,9 +207,19 @@ def build_user_schema_description(db_engine: Engine) -> str:
         "my_attractions": "attraction_bookings",
     }
 
+    available_tables = set(inspector.get_table_names())
     lines: List[str] = []
 
     for view_name, base_table in view_to_base.items():
+        # Skip views whose base table isn't present in this database. This
+        # keeps the assistant working across environments where some tables
+        # (e.g. the booking tables) may not exist.
+        if base_table not in available_tables:
+            logger.warning(
+                "Base table '%s' not found; skipping view '%s'",
+                base_table, view_name,
+            )
+            continue
         columns = inspector.get_columns(base_table)
         col_parts = [f"{col['name']} {col['type']}" for col in columns]
         lines.append(
@@ -261,7 +266,9 @@ _PROTECTED_TABLE_REF = re.compile(
 )
 
 
-def sanitize_sql(raw_sql: str, max_rows: int) -> str:
+def sanitize_sql(
+    raw_sql: str, max_rows: int, available_tables: Optional[set] = None
+) -> str:
     """Validate an LLM SELECT and wrap it in the per-user secured CTE.
 
     The returned SQL is a single read-only statement whose only data sources
@@ -304,7 +311,7 @@ def sanitize_sql(raw_sql: str, max_rows: int) -> str:
 
     # Prepend the secured, user-scoped CTE. The final query can only read
     # from the my_* views defined here.
-    return f"{build_secured_cte()}\n{sql}"
+    return f"{build_secured_cte(available_tables)}\n{sql}"
 
 
 # ============================================================
@@ -458,6 +465,7 @@ class QueryAssistant:
     llm: ChatGoogleGenerativeAI
     db_engine: Engine
     schema: str
+    available_tables: set
 
     @classmethod
     def bootstrap(
@@ -468,9 +476,14 @@ class QueryAssistant:
         settings = settings or load_settings()
         db_engine = db_engine or default_engine
 
+        available_tables = set(inspect(db_engine).get_table_names())
+
         # The LLM only ever sees the per-user secured views, never raw tables.
         schema = build_user_schema_description(db_engine)
-        logger.info("Loaded user-scoped schema (%d views)", len(_SECURED_VIEWS))
+        logger.info(
+            "Loaded user-scoped schema (%d tables available)",
+            len(available_tables),
+        )
 
         llm = build_llm(settings)
 
@@ -479,6 +492,7 @@ class QueryAssistant:
             llm=llm,
             db_engine=db_engine,
             schema=schema,
+            available_tables=available_tables,
         )
 
     def ask(self, question: str, user_id: int) -> str:
@@ -496,7 +510,9 @@ class QueryAssistant:
         logger.info("Question (user_id=%s): %s", user_id, question)
 
         raw_sql = generate_sql(self.llm, self.schema, question)
-        sql = sanitize_sql(raw_sql, self.settings.max_rows)
+        sql = sanitize_sql(
+            raw_sql, self.settings.max_rows, self.available_tables
+        )
         logger.info("Secured SQL: %s", sql)
 
         rows = execute_query(self.db_engine, sql, user_id)
