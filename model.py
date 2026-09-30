@@ -55,6 +55,13 @@ from sqlalchemy.orm import (
 # 1. ENGINE / SESSION
 # ============================================================
 
+# Load .env BEFORE reading DATABASE_URL. This module is imported (transitively)
+# at server startup before any other load_dotenv() runs, so without this the
+# env var would be unset and we'd silently fall back to SQLite.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///tourism.db")
 
 engine = create_engine(
