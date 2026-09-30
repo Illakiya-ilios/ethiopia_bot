@@ -11,3 +11,4 @@ langgraph>=1.0
 streamlit>=1.30
 fastapi>=0.110
 uvicorn>=0.30
+google-cloud-vision>=3.4

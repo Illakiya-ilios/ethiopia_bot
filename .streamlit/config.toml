@@ -1,0 +1,11 @@
+[theme]
+# Pin a light theme so custom CSS (dark text on light bubbles) is always
+# readable regardless of the user's OS/browser dark-mode preference.
+base = "light"
+primaryColor = "#078930"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3FAF4"
+textColor = "#1A1A1A"
+
+[server]
+headless = true
