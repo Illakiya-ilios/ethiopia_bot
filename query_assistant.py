@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from model import engine as default_engine
 
@@ -98,16 +98,15 @@ def configure_logging(level: str = "WARNING") -> None:
 class Settings:
     """Environment-driven settings for the query assistant."""
 
-    gcp_project_id: str
-    gcp_location: str = "us-central1"
+    google_api_key: str
     llm_model: str = "gemini-2.0-flash-lite"
     llm_temperature: float = 0.0
     max_rows: int = 100
     log_level: str = "WARNING"
 
     def validate(self) -> None:
-        if not self.gcp_project_id:
-            raise ConfigurationError("GCP_PROJECT_ID is required.")
+        if not self.google_api_key:
+            raise ConfigurationError("GOOGLE_API_KEY is required.")
         if self.max_rows <= 0:
             raise ConfigurationError("MAX_ROWS must be positive.")
 
@@ -116,8 +115,7 @@ def load_settings() -> Settings:
     load_dotenv()
 
     settings = Settings(
-        gcp_project_id=os.getenv("GCP_PROJECT_ID", ""),
-        gcp_location=os.getenv("GCP_LOCATION", "us-central1"),
+        google_api_key=os.getenv("GOOGLE_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash-lite"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         max_rows=int(os.getenv("MAX_ROWS", "100")),
@@ -314,14 +312,13 @@ def sanitize_sql(raw_sql: str, max_rows: int) -> str:
 # ============================================================
 
 
-def build_llm(settings: Settings) -> ChatVertexAI:
-    logger.info("Initializing Vertex AI Gemini model '%s'", settings.llm_model)
+def build_llm(settings: Settings) -> ChatGoogleGenerativeAI:
+    logger.info("Initializing Gemini model '%s'", settings.llm_model)
 
-    return ChatVertexAI(
+    return ChatGoogleGenerativeAI(
         model=settings.llm_model,
         temperature=settings.llm_temperature,
-        project=settings.gcp_project_id,
-        location=settings.gcp_location,
+        google_api_key=settings.google_api_key,
     )
 
 
@@ -350,7 +347,7 @@ STRICT RULES:
 
 
 def generate_sql(
-    llm: ChatVertexAI,
+    llm: ChatGoogleGenerativeAI,
     schema: str,
     question: str,
 ) -> str:
@@ -395,7 +392,7 @@ RULES:
 
 
 def synthesize_answer(
-    llm: ChatVertexAI,
+    llm: ChatGoogleGenerativeAI,
     question: str,
     sql: str,
     rows: List[dict],
@@ -458,7 +455,7 @@ class QueryAssistant:
     """Answers natural-language questions over the tourism database."""
 
     settings: Settings
-    llm: ChatVertexAI
+    llm: ChatGoogleGenerativeAI
     db_engine: Engine
     schema: str
 

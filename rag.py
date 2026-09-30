@@ -3,8 +3,8 @@
 A single-file Retrieval-Augmented Generation application backed entirely by
 Google Cloud Platform managed services:
 
-    - Embeddings : Vertex AI Text Embeddings   (text-embedding-005)
-    - Generation : Vertex AI Gemini            (gemini-2.0-flash-lite)
+    - Embeddings : Gemini API Text Embeddings  (models/text-embedding-004)
+    - Generation : Gemini API                  (gemini-2.0-flash-lite)
     - Retrieval  : Hybrid (BM25 + dense vector) over a persisted vector store
 
 Enterprise concerns addressed here:
@@ -41,7 +41,10 @@ from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
+)
 
 from pydantic import Field
 
@@ -136,14 +139,13 @@ class Settings:
     half-configured state.
     """
 
-    # GCP core
-    gcp_project_id: str
-    gcp_location: str = "us-central1"
+    # Gemini API (Google AI Studio key)
+    google_api_key: str
 
-    # Embeddings (Vertex AI)
-    embedding_model: str = "text-embedding-005"
+    # Embeddings (Gemini API)
+    embedding_model: str = "models/text-embedding-004"
 
-    # Generation (Vertex AI Gemini)
+    # Generation (Gemini API)
     llm_model: str = "gemini-2.0-flash-lite"
     llm_temperature: float = 0.0
     llm_max_output_tokens: int = 2048
@@ -175,8 +177,8 @@ class Settings:
     def validate(self) -> None:
         """Fail fast on invalid configuration."""
 
-        if not self.gcp_project_id:
-            raise ConfigurationError("GCP_PROJECT_ID is required.")
+        if not self.google_api_key:
+            raise ConfigurationError("GOOGLE_API_KEY is required.")
 
         if self.chunk_overlap >= self.chunk_size:
             raise ConfigurationError(
@@ -223,9 +225,8 @@ def load_settings() -> Settings:
     load_dotenv()
 
     settings = Settings(
-        gcp_project_id=os.getenv("GCP_PROJECT_ID", ""),
-        gcp_location=os.getenv("GCP_LOCATION", "us-central1"),
-        embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-005"),
+        google_api_key=os.getenv("GOOGLE_API_KEY", ""),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "models/text-embedding-004"),
         llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash-lite"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         llm_max_output_tokens=int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2048")),
@@ -252,22 +253,17 @@ def load_settings() -> Settings:
 # ============================================================
 
 
-def build_embeddings(settings: Settings) -> VertexAIEmbeddings:
-    """Create the Vertex AI embeddings client.
-
-    Uses Application Default Credentials. No local model weights are loaded;
-    embedding requests are served by Vertex AI in ``settings.gcp_location``.
-    """
+def build_embeddings(settings: Settings) -> GoogleGenerativeAIEmbeddings:
+    """Create the Gemini API embeddings client (uses GOOGLE_API_KEY)."""
 
     logger.info(
-        "Initializing Vertex AI embeddings model '%s'",
+        "Initializing Gemini embeddings model '%s'",
         settings.embedding_model,
     )
 
-    return VertexAIEmbeddings(
-        model_name=settings.embedding_model,
-        project=settings.gcp_project_id,
-        location=settings.gcp_location,
+    return GoogleGenerativeAIEmbeddings(
+        model=settings.embedding_model,
+        google_api_key=settings.google_api_key,
     )
 
 
@@ -374,7 +370,7 @@ def split_documents(
 
 def create_vector_store(
     settings: Settings,
-    embeddings: VertexAIEmbeddings,
+    embeddings: GoogleGenerativeAIEmbeddings,
     chunks: List[Document],
 ) -> Chroma:
     """Build and persist the vector store from freshly embedded chunks."""
@@ -421,7 +417,7 @@ def _remove_store(chroma_dir: str) -> None:
 
 def load_vector_store(
     settings: Settings,
-    embeddings: VertexAIEmbeddings,
+    embeddings: GoogleGenerativeAIEmbeddings,
 ) -> Chroma:
     """Open an already-persisted vector store."""
 
@@ -441,7 +437,7 @@ def load_vector_store(
 
 def get_vector_database(
     settings: Settings,
-    embeddings: VertexAIEmbeddings,
+    embeddings: GoogleGenerativeAIEmbeddings,
 ) -> Chroma:
     """Return a ready-to-use vector store, building it on first run."""
 
@@ -599,17 +595,16 @@ def format_context(documents: List[Document]) -> str:
 # ============================================================
 
 
-def build_llm(settings: Settings) -> ChatVertexAI:
-    """Create the Vertex AI Gemini chat model."""
+def build_llm(settings: Settings) -> ChatGoogleGenerativeAI:
+    """Create the Gemini API chat model (uses GOOGLE_API_KEY)."""
 
-    logger.info("Initializing Vertex AI Gemini model '%s'", settings.llm_model)
+    logger.info("Initializing Gemini model '%s'", settings.llm_model)
 
-    return ChatVertexAI(
+    return ChatGoogleGenerativeAI(
         model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
-        project=settings.gcp_project_id,
-        location=settings.gcp_location,
+        google_api_key=settings.google_api_key,
     )
 
 
@@ -666,7 +661,7 @@ RULES:
 
 
 def generate_answer(
-    llm: ChatVertexAI,
+    llm: ChatGoogleGenerativeAI,
     question: str,
     context: str,
 ) -> str:
@@ -714,7 +709,7 @@ class RagService:
     """
 
     settings: Settings
-    llm: ChatVertexAI
+    llm: ChatGoogleGenerativeAI
     retriever: HybridRetriever
 
     @classmethod

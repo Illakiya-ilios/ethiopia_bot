@@ -35,7 +35,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from endpoints import SITE_PAGES, festival_register_url, match_package_slug
 
@@ -95,35 +95,28 @@ def configure_logging(level: str = "WARNING") -> None:
 class Settings:
     """Environment-driven settings for the form assistant."""
 
-    gcp_project_id: str
-    gcp_location: str = "us-central1"
+    google_api_key: str
     llm_model: str = "gemini-2.0-flash-lite"
+    # A vision-capable model for passport OCR (Gemini reads the image directly).
+    ocr_model: str = "gemini-2.0-flash"
     llm_temperature: float = 0.0
-
-    # OCR
-    ocr_backend: str = "vision"          # "vision" (only backend for POC)
     max_image_bytes: int = 8 * 1024 * 1024
 
     log_level: str = "WARNING"
 
     def validate(self) -> None:
-        if not self.gcp_project_id:
-            raise ConfigurationError("GCP_PROJECT_ID is required.")
-        if self.ocr_backend not in {"vision"}:
-            raise ConfigurationError(
-                f"Unsupported OCR_BACKEND: {self.ocr_backend}"
-            )
+        if not self.google_api_key:
+            raise ConfigurationError("GOOGLE_API_KEY is required.")
 
 
 def load_settings() -> Settings:
     load_dotenv()
 
     settings = Settings(
-        gcp_project_id=os.getenv("GCP_PROJECT_ID", ""),
-        gcp_location=os.getenv("GCP_LOCATION", "us-central1"),
+        google_api_key=os.getenv("GOOGLE_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash-lite"),
+        ocr_model=os.getenv("OCR_MODEL", "gemini-2.0-flash"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
-        ocr_backend=os.getenv("OCR_BACKEND", "vision"),
         max_image_bytes=int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024))),
         log_level=os.getenv("LOG_LEVEL", "WARNING"),
     )
@@ -322,7 +315,7 @@ USER MESSAGE:
 ANSWER:"""
 
 
-def classify_fill_source(llm: ChatVertexAI, message: str) -> DataSource:
+def classify_fill_source(llm: ChatGoogleGenerativeAI, message: str) -> DataSource:
     """Decide which data source the user is asking to fill from."""
 
     lowered = message.lower()
@@ -411,7 +404,7 @@ def _parse_json_object(raw: str) -> dict[str, str]:
     return result
 
 
-def extract_fields_from_message(llm: ChatVertexAI, message: str) -> dict[str, str]:
+def extract_fields_from_message(llm: ChatGoogleGenerativeAI, message: str) -> dict[str, str]:
     """LLM extracts canonical field values from the current message."""
 
     try:
@@ -425,7 +418,7 @@ def extract_fields_from_message(llm: ChatVertexAI, message: str) -> dict[str, st
 
 
 def extract_fields_from_history(
-    llm: ChatVertexAI, history: list[dict]
+    llm: ChatGoogleGenerativeAI, history: list[dict]
 ) -> dict[str, str]:
     """Consent-gated: mine prior chat turns for reusable field values."""
 
@@ -448,20 +441,32 @@ def extract_fields_from_history(
 
 
 # ============================================================
-# 7. OCR PIPELINE (GCP Cloud Vision + passport parsing)
+# 7. OCR PIPELINE (Gemini vision — reads the passport image directly)
 # ============================================================
 
 
-def build_ocr_client(settings: Settings):
-    """Create a Cloud Vision client (keyless ADC). Imported lazily."""
+_PASSPORT_OCR_PROMPT = f"""You are reading a passport image. Extract the holder's
+details and return ONLY a compact JSON object mapping canonical keys to string
+values.
 
-    from google.cloud import vision
+Allowed keys: {", ".join(sorted(CANONICAL_KEYS))}
 
-    return vision.ImageAnnotatorClient()
+Rules:
+- Prefer the Machine Readable Zone (MRZ, the two lines of <<< at the bottom) for
+  accuracy, but also use the printed labels.
+- Normalize all dates to ISO YYYY-MM-DD.
+- Use full country/nationality names (e.g. "Indian", not "IND").
+- gender must be "Male" or "Female".
+- Only include keys you can read with confidence. Omit anything unclear.
+- If the image is not a readable passport, return {{}}.
+- Output ONLY the JSON object, no prose, no markdown.
+"""
 
 
-def run_passport_ocr(client, image_bytes: bytes, settings: Settings) -> str:
-    """Run Cloud Vision document_text_detection; return full text incl. MRZ.
+def run_passport_ocr(
+    llm: ChatGoogleGenerativeAI, image_bytes: bytes, settings: Settings
+) -> dict[str, str]:
+    """Read a passport image with Gemini vision and return canonical fields.
 
     Preconditions: consent granted (enforced by caller); non-empty image within
     the size limit. Does NOT persist the image.
@@ -472,113 +477,30 @@ def run_passport_ocr(client, image_bytes: bytes, settings: Settings) -> str:
     if len(image_bytes) > settings.max_image_bytes:
         raise OcrQualityError("Image is too large.")
 
-    from google.cloud import vision
+    import base64
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _PASSPORT_OCR_PROMPT},
+            {
+                "type": "image_url",
+                "image_url": f"data:image/jpeg;base64,{b64}",
+            },
+        ],
+    }
 
     try:
-        image = vision.Image(content=image_bytes)
-        response = client.document_text_detection(image=image)
+        response = llm.invoke([message])
     except Exception as exc:  # noqa: BLE001
-        raise OcrError(f"OCR service error: {exc}") from exc
+        raise OcrError(f"OCR (Gemini vision) failed: {exc}") from exc
 
-    if response.error.message:
-        raise OcrError(response.error.message)
+    fields = _parse_json_object(response.content)
 
-    text = response.full_text_annotation.text if response.full_text_annotation else ""
-
-    if len(text.strip()) < 20:
-        raise OcrQualityError("Could not read enough text from the image.")
-
-    return text
-
-
-# --- MRZ (TD3 passport) parsing -------------------------------------------
-
-_MRZ_COUNTRY_TO_NAME = {
-    "IND": "Indian", "USA": "American", "GBR": "British", "DEU": "German",
-    "FRA": "French", "KEN": "Kenyan", "ETH": "Ethiopian",
-}
-
-
-def _mrz_date_to_iso(yymmdd: str, expiry: bool = False) -> Optional[str]:
-    """Convert MRZ YYMMDD to ISO YYYY-MM-DD with a century heuristic."""
-
-    if not re.fullmatch(r"\d{6}", yymmdd):
-        return None
-    yy, mm, dd = int(yymmdd[:2]), yymmdd[2:4], yymmdd[4:6]
-    # DOB: 20xx if <= current 2-digit year else 19xx. Expiry: always 20xx.
-    now_yy = datetime.now().year % 100
-    century = 2000 if (expiry or yy <= now_yy) else 1900
-    year = century + yy
-    try:
-        datetime(year, int(mm), int(dd))
-    except ValueError:
-        return None
-    return f"{year:04d}-{mm}-{dd}"
-
-
-def parse_passport_fields(ocr_text: str) -> dict[str, str]:
-    """Parse OCR text into canonical passport fields (MRZ preferred)."""
-
-    fields: dict[str, str] = {}
-
-    # Find TD3 MRZ: two lines of ~44 chars using A-Z0-9<.
-    mrz_lines = [
-        ln.replace(" ", "")
-        for ln in ocr_text.splitlines()
-        if re.fullmatch(r"[A-Z0-9<]{30,44}", ln.replace(" ", ""))
-    ]
-
-    if len(mrz_lines) >= 2:
-        line1, line2 = mrz_lines[-2], mrz_lines[-1]
-
-        # Line 1: P<ISSUING<SURNAME<<GIVEN<NAMES
-        m = re.match(r"P[A-Z<]?([A-Z]{3})(.+)", line1)
-        if m:
-            issuing = m.group(1)
-            fields["passport_issuing_country"] = _MRZ_COUNTRY_TO_NAME.get(
-                issuing, issuing
-            )
-            names = m.group(2)
-            if "<<" in names:
-                surname_part, given_part = names.split("<<", 1)
-                surname = surname_part.replace("<", " ").strip()
-                given = given_part.replace("<", " ").strip()
-                if surname:
-                    fields["surname"] = surname.title()
-                if given:
-                    fields["given_name"] = given.title()
-                if surname or given:
-                    fields["full_name"] = f"{given.title()} {surname.title()}".strip()
-
-        # Line 2: passport_no(9) chk(1) nationality(3) dob(6) chk sex(1) exp(6)...
-        if len(line2) >= 28:
-            passport_no = line2[0:9].replace("<", "").strip()
-            nationality = line2[10:13]
-            dob = line2[13:19]
-            sex = line2[20:21]
-            expiry = line2[21:27]
-
-            if passport_no:
-                fields["passport_no"] = passport_no
-            if re.fullmatch(r"[A-Z]{3}", nationality):
-                fields["nationality"] = _MRZ_COUNTRY_TO_NAME.get(
-                    nationality, nationality
-                )
-            dob_iso = _mrz_date_to_iso(dob)
-            if dob_iso:
-                fields["date_of_birth"] = dob_iso
-            if sex in ("M", "F"):
-                fields["gender"] = "Male" if sex == "M" else "Female"
-            exp_iso = _mrz_date_to_iso(expiry, expiry=True)
-            if exp_iso:
-                fields["passport_expiry_date"] = exp_iso
-
-    # Fallback: labeled-line heuristics for anything MRZ didn't yield.
-    if "passport_no" not in fields:
-        m = re.search(r"passport\s*(?:no|number)[:\s]+([A-Z0-9]{6,10})",
-                      ocr_text, re.IGNORECASE)
-        if m:
-            fields["passport_no"] = m.group(1).upper()
+    if not fields:
+        raise OcrQualityError("Could not read passport details from the image.")
 
     return fields
 
@@ -662,23 +584,27 @@ class FormAssistant:
     """Navigates + fills the registration form. Never writes DB, never submits."""
 
     settings: Settings
-    llm: ChatVertexAI
-    ocr_client: object
+    llm: ChatGoogleGenerativeAI
+    ocr_llm: ChatGoogleGenerativeAI
 
     @classmethod
     def bootstrap(cls, settings: Optional[Settings] = None) -> "FormAssistant":
         settings = settings or load_settings()
 
-        logger.info("Initializing form assistant (Gemini + Vision, ADC)")
-        llm = ChatVertexAI(
+        logger.info("Initializing form assistant (Gemini API key)")
+        llm = ChatGoogleGenerativeAI(
             model=settings.llm_model,
             temperature=settings.llm_temperature,
-            project=settings.gcp_project_id,
-            location=settings.gcp_location,
+            google_api_key=settings.google_api_key,
         )
-        ocr_client = build_ocr_client(settings)
+        # A vision-capable Gemini model for reading passport images.
+        ocr_llm = ChatGoogleGenerativeAI(
+            model=settings.ocr_model,
+            temperature=0.0,
+            google_api_key=settings.google_api_key,
+        )
 
-        return cls(settings=settings, llm=llm, ocr_client=ocr_client)
+        return cls(settings=settings, llm=llm, ocr_llm=ocr_llm)
 
     def handle(
         self,
@@ -746,8 +672,9 @@ class FormAssistant:
                     consent,
                 )
             try:
-                text = run_passport_ocr(self.ocr_client, image_bytes, self.settings)
-                canonical = parse_passport_fields(text)
+                canonical = run_passport_ocr(
+                    self.ocr_llm, image_bytes, self.settings
+                )
             except OcrQualityError:
                 return FormAssistantResult(
                     "I couldn't read the passport clearly. Please try a sharper, "

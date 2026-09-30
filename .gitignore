@@ -8,6 +8,9 @@
 *.key
 credentials.json
 service-account*.json
+sa-key.json
+*-key.json
+gcp-*.json
 # GCP Application Default Credentials (never commit)
 application_default_credentials.json
 

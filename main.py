@@ -39,7 +39,7 @@ from typing import Literal, Optional, TypedDict
 
 from dotenv import load_dotenv
 
-from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
 
 from rag import RagService
@@ -142,7 +142,7 @@ USER MESSAGE:
 CATEGORY:"""
 
 
-def classify_intent(llm: ChatVertexAI, question: str) -> Route:
+def classify_intent(llm: ChatGoogleGenerativeAI, question: str) -> Route:
     """Ask Gemini to pick a route; default to discovery if unclear."""
 
     try:
@@ -196,7 +196,7 @@ PAGE ID:"""
 
 
 def resolve_navigation_target(
-    llm: ChatVertexAI, question: str
+    llm: ChatGoogleGenerativeAI, question: str
 ) -> Optional[dict]:
     """Map a navigation request to a known page dict {"page", "url"}.
 
@@ -244,7 +244,7 @@ class Supervisor:
 
     def __init__(
         self,
-        router_llm: ChatVertexAI,
+        router_llm: ChatGoogleGenerativeAI,
         rag_service: RagService,
         query_assistant: QueryAssistant,
         form_assistant: FormAssistant,
@@ -427,11 +427,10 @@ def build_supervisor() -> Supervisor:
 
     settings = load_query_settings()
 
-    router_llm = ChatVertexAI(
+    router_llm = ChatGoogleGenerativeAI(
         model=settings.llm_model,
         temperature=0.0,
-        project=settings.gcp_project_id,
-        location=settings.gcp_location,
+        google_api_key=settings.google_api_key,
     )
 
     logger.info("Bootstrapping discovery (RAG) service...")
