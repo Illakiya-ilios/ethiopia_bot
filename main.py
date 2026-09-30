@@ -44,7 +44,21 @@ from langgraph.graph import END, START, StateGraph
 
 from rag import RagService
 from query_assistant import QueryAssistant, load_settings as load_query_settings
-from endpoints import SITE_PAGES
+from form_assistant import (
+    ConsentState,
+    ConsentStatus,
+    FormAssistant,
+    FormAssistantResult,
+)
+from endpoints import SITE_PAGES, festival_register_url, match_package_slug
+
+
+def _consent_status(value) -> "ConsentStatus":
+    """Coerce a stored consent string back into a ConsentStatus enum."""
+    try:
+        return ConsentStatus(value) if value else ConsentStatus.NOT_ASKED
+    except ValueError:
+        return ConsentStatus.NOT_ASKED
 
 
 logger = logging.getLogger("supervisor")
@@ -60,26 +74,35 @@ class AgentState(TypedDict, total=False):
 
     question: str
     user_id: int
-    route: str                    # "discovery" | "bookings" | "navigate"
+    route: str                    # discovery | bookings | navigate | register
     answer: str
     navigation: Optional[dict]    # {"page": str, "url": str} for the frontend
 
+    # --- form-fill (register route) state, carried across turns ---
+    history: list                 # prior chat turns [{role, content}]
+    image_bytes: Optional[bytes]  # transient passport upload (never persisted)
+    consent: object               # ConsentState
+    command: Optional[dict]       # FormFillCommand.to_dict() for the frontend
 
-Route = Literal["discovery", "bookings", "navigate"]
+
+Route = Literal["discovery", "bookings", "navigate", "register"]
 
 
 @dataclass
 class ChatResult:
     """Structured result returned to the API/frontend.
 
-    ``navigation`` is non-None only when the user asked to be taken to a page;
-    the frontend uses ``navigation["url"]`` to open/redirect. The bot never
-    navigates the browser itself — it only returns the directive.
+    - ``navigation`` is non-None when the user asked to open a page.
+    - ``command`` is non-None on the register route: it carries navigation +
+      field values the frontend applies to the form (never a submit, no DB).
+    - ``consent`` is echoed back so the frontend can persist it across turns.
     """
 
     answer: str
     route: str
     navigation: Optional[dict] = None
+    command: Optional[dict] = None
+    consent: Optional[dict] = None
 
 
 # ============================================================
@@ -91,9 +114,15 @@ ROUTER_PROMPT = """You are a router for an Ethiopia tourism assistant.
 
 Classify the user's message into exactly ONE category:
 
+- "register": the user wants help FILLING OUT the registration form — using
+  their passport image, reusing details they already gave, or dictating field
+  values. Also when replying yes/no to a form-fill consent question.
+  Signals: "fill the form", "use my passport", "scan my passport",
+  "use what I already told you", "fill in my details", "help me register the form".
+
 - "navigate": the user wants to GO TO / OPEN a page on the website — e.g.
   "take me to registration", "open the visa page", "go to my packages",
-  "show me the registration form", "sign me up", "I want to register".
+  "show me the registration form".
   Signals: "take me to", "open", "go to", "navigate", "show me the ... page".
 
 - "bookings": questions about the user's OWN account data — their package
@@ -105,7 +134,7 @@ Classify the user's message into exactly ONE category:
   attractions, culture, history, visa rules in general, travel tips,
   itineraries, "what can I do / see / visit", recommendations.
 
-Respond with ONLY one word: navigate OR bookings OR discovery.
+Respond with ONLY one word: register OR navigate OR bookings OR discovery.
 
 USER MESSAGE:
 {question}
@@ -123,6 +152,9 @@ def classify_intent(llm: ChatVertexAI, question: str) -> Route:
         logger.error("Intent classification failed: %s", exc)
         return "discovery"
 
+    if "register" in label:
+        return "register"
+
     if "navigate" in label:
         return "navigate"
 
@@ -139,13 +171,14 @@ def classify_intent(llm: ChatVertexAI, question: str) -> Route:
 
 # Keywords mapped to a known page id in endpoints.SITE_PAGES.
 _PAGE_KEYWORDS = {
-    "register": ["register", "registration", "sign up", "signup", "enroll"],
-    "my_packages": ["my package", "my packages", "my booking", "my trip",
-                    "my requests", "package requests"],
-    "visa": ["visa"],
-    "packages": ["packages", "package list", "tour", "browse"],
-    "login": ["login", "log in", "sign in"],
-    "home": ["home", "homepage", "main page", "start"],
+    "packages": ["packages", "package", "itinerary", "itineraries", "trip",
+                 "tour", "browse packages"],
+    "calendar": ["calendar", "festival calendar", "dates", "schedule"],
+    "flagship": ["flagship", "flagship festival", "main festival"],
+    "heritage": ["heritage", "history", "historic", "culture"],
+    "stopover": ["stopover", "stop over", "layover"],
+    "closing": ["closing", "strategy", "plan"],
+    "home": ["home", "homepage", "main page", "start", "top", "landing"],
 }
 
 
@@ -173,7 +206,12 @@ def resolve_navigation_target(
 
     lowered = question.lower()
 
-    # 1) Fast path: keyword match.
+    # 0) Specific package/festival deep-link (path-based /packages/<slug>).
+    slug = match_package_slug(lowered)
+    if slug:
+        return {"page": f"package_{slug}", "url": festival_register_url(slug)}
+
+    # 1) Fast path: keyword match against landing-page sections.
     for page_id, keywords in _PAGE_KEYWORDS.items():
         if any(kw in lowered for kw in keywords) and page_id in SITE_PAGES:
             return {"page": page_id, "url": SITE_PAGES[page_id]}
@@ -209,10 +247,12 @@ class Supervisor:
         router_llm: ChatVertexAI,
         rag_service: RagService,
         query_assistant: QueryAssistant,
+        form_assistant: FormAssistant,
     ) -> None:
         self.router_llm = router_llm
         self.rag_service = rag_service
         self.query_assistant = query_assistant
+        self.form_assistant = form_assistant
         self.graph = self._build_graph()
 
     # ---- node implementations ------------------------------------------
@@ -262,6 +302,24 @@ class Supervisor:
             "navigation": target,
         }
 
+    def _register_node(self, state: AgentState) -> AgentState:
+        result: FormAssistantResult = self.form_assistant.handle(
+            state["question"],
+            user_id=state.get("user_id"),
+            history=state.get("history", []),
+            image_bytes=state.get("image_bytes"),
+            consent=state.get("consent") or ConsentState(),
+        )
+
+        command = result.command
+        return {
+            "answer": result.answer,
+            "command": command.to_dict() if command else None,
+            "navigation": command.navigate_to if command else None,
+            "consent": result.consent,
+            "image_bytes": None,   # clear transient image after handling
+        }
+
     # ---- routing edge ---------------------------------------------------
 
     @staticmethod
@@ -275,6 +333,7 @@ class Supervisor:
         graph.add_node("discovery", self._discovery_node)
         graph.add_node("bookings", self._bookings_node)
         graph.add_node("navigate", self._navigate_node)
+        graph.add_node("register", self._register_node)
 
         graph.add_edge(START, "supervisor")
         graph.add_conditional_edges(
@@ -284,33 +343,70 @@ class Supervisor:
                 "discovery": "discovery",
                 "bookings": "bookings",
                 "navigate": "navigate",
+                "register": "register",
             },
         )
         graph.add_edge("discovery", END)
         graph.add_edge("bookings", END)
         graph.add_edge("navigate", END)
+        graph.add_edge("register", END)
 
         return graph.compile()
 
     # ---- public API -----------------------------------------------------
 
-    def chat(self, question: str, user_id: Optional[int] = None) -> ChatResult:
+    def chat(
+        self,
+        question: str,
+        user_id: Optional[int] = None,
+        *,
+        history: Optional[list] = None,
+        image_bytes: Optional[bytes] = None,
+        consent: Optional[dict] = None,
+    ) -> ChatResult:
         """Route and answer, returning a structured result for the frontend.
 
         ``user_id`` must come from a trusted/authenticated session; it is only
         used by the bookings path and never influences routing.
+
+        Form-fill context (register route) is passed through and echoed back:
+        - ``history``: prior chat turns, for chat-history extraction.
+        - ``image_bytes``: transient passport upload (never persisted).
+        - ``consent``: dict form of ConsentState, persisted by the frontend
+          across turns.
         """
 
         initial: AgentState = {"question": question}
         if user_id:
             initial["user_id"] = user_id
+        if history:
+            initial["history"] = history
+        if image_bytes:
+            initial["image_bytes"] = image_bytes
+        if consent:
+            initial["consent"] = ConsentState(
+                passport_ocr=_consent_status(consent.get("passport_ocr")),
+                chat_history=_consent_status(consent.get("chat_history")),
+            )
 
         result = self.graph.invoke(initial)
+
+        consent_obj = result.get("consent")
+        consent_out = (
+            {
+                "passport_ocr": consent_obj.passport_ocr.value,
+                "chat_history": consent_obj.chat_history.value,
+            }
+            if consent_obj is not None
+            else None
+        )
 
         return ChatResult(
             answer=result.get("answer", "Sorry, I couldn't produce an answer."),
             route=result.get("route", "discovery"),
             navigation=result.get("navigation"),
+            command=result.get("command"),
+            consent=consent_out,
         )
 
     def ask(self, question: str, user_id: Optional[int] = None) -> str:
@@ -344,10 +440,14 @@ def build_supervisor() -> Supervisor:
     logger.info("Bootstrapping bookings (query) assistant...")
     query_assistant = QueryAssistant.bootstrap(settings)
 
+    logger.info("Bootstrapping registration (form-fill) assistant...")
+    form_assistant = FormAssistant.bootstrap()
+
     return Supervisor(
         router_llm=router_llm,
         rag_service=rag_service,
         query_assistant=query_assistant,
+        form_assistant=form_assistant,
     )
 
 

@@ -1,33 +1,29 @@
 """Registration Form Assistant — bot #3 of the Ethiopia Tourism suite.
 
-Helps a signed-in traveller register for a package by driving a website's
-registration form from chat. This is "World A": the bot and the website share
-one UI. The bot can NAVIGATE the site and FILL form fields, under three hard,
-code-enforced boundaries:
+Helps a signed-in traveller register for a package by driving the website's
+registration form from chat. Operates under three HARD constraints:
 
-    1. NO database writes.  The register path opens no DB session; it only
-       emits a FormFillCommand that the frontend applies.
-    2. NO auto-submit.      FormFillCommand has no submit capability. The user
-       reviews every field and submits manually.
-    3. CONSENT-GATED fill.  Passport OCR and chat-history reuse only run AFTER
-       the bot asks and the user explicitly agrees.
+    1. NO database writes. It only emits FormFillCommand values the frontend
+       applies to form fields.
+    2. NO auto-submit. The user reviews every field and submits manually; the
+       command schema has no submit capability.
+    3. CONSENT-GATED auto-fill. Passport OCR and chat-history reuse only run
+       AFTER the bot asks and the user explicitly agrees.
 
-Auto-fill data sources (both consent-gated except live conversation):
+Auto-fill data sources:
     - conversation : values the user dictates in the current message
     - passport_ocr : GCP Cloud Vision OCR over an uploaded passport image
-    - chat_history : reuse of details the user already provided
+                     (keyless ADC), with MRZ + labeled-text parsing
+    - chat_history : reuse details already provided earlier in the chat
 
-Auth is keyless via Application Default Credentials (ADC), consistent with the
-rest of the app. Passport images are transient and never persisted.
+Fits the existing enterprise single-file style: frozen Settings, typed
+exception hierarchy, structured logging, lazy bootstrap(), a service class.
 
-Run standalone (text-only flows; OCR needs an image + GCP creds):
-
-    python form_assistant.py
+Auth uses Application Default Credentials (ADC); no API keys.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -40,6 +36,8 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from langchain_google_vertexai import ChatVertexAI
+
+from endpoints import SITE_PAGES, festival_register_url, match_package_slug
 
 
 # ============================================================
@@ -56,15 +54,15 @@ class ConfigurationError(FormAssistantError):
 
 
 class OcrError(FormAssistantError):
-    """Raised when the OCR service call fails (transport / ADC)."""
+    """Raised when the OCR service call fails (transport/ADC)."""
 
 
 class OcrQualityError(OcrError):
-    """Raised when an image is unreadable / too sparse to be a passport."""
+    """Raised when the image is unreadable / too sparse to parse."""
 
 
 class ExtractionError(FormAssistantError):
-    """Raised when the LLM value extraction fails."""
+    """Raised when LLM value extraction fails."""
 
 
 # ============================================================
@@ -76,19 +74,15 @@ logger = logging.getLogger("form_assistant")
 
 
 def configure_logging(level: str = "WARNING") -> None:
-    """Configure root logging (quiet by default; LOG_LEVEL=INFO for detail)."""
-
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
         logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
     )
-
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level.upper())
-
-    for noisy in ("urllib3", "google.auth", "grpc", "sqlalchemy"):
+    for noisy in ("urllib3", "google.auth", "grpc", "sqlalchemy", "httpx"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -107,30 +101,18 @@ class Settings:
     llm_temperature: float = 0.0
 
     # OCR
-    ocr_backend: str = "vision"                 # "vision" | "document_ai"
-    ocr_location: str = "us"                     # Document AI processor location
-    doc_ai_processor_id: str = ""                # required only for document_ai
-    max_image_bytes: int = 8 * 1024 * 1024       # reject oversized uploads
-
-    # Demo site — placeholders, swapped for the real form later.
-    known_pages: tuple[str, ...] = ("registration", "home", "packages", "visa")
-    registration_path: str = "/register"
+    ocr_backend: str = "vision"          # "vision" (only backend for POC)
+    max_image_bytes: int = 8 * 1024 * 1024
 
     log_level: str = "WARNING"
 
     def validate(self) -> None:
         if not self.gcp_project_id:
             raise ConfigurationError("GCP_PROJECT_ID is required.")
-        if self.ocr_backend not in {"vision", "document_ai"}:
+        if self.ocr_backend not in {"vision"}:
             raise ConfigurationError(
-                "OCR_BACKEND must be 'vision' or 'document_ai'."
+                f"Unsupported OCR_BACKEND: {self.ocr_backend}"
             )
-        if self.ocr_backend == "document_ai" and not self.doc_ai_processor_id:
-            raise ConfigurationError(
-                "DOC_AI_PROCESSOR_ID is required when OCR_BACKEND=document_ai."
-            )
-        if self.max_image_bytes <= 0:
-            raise ConfigurationError("MAX_IMAGE_BYTES must be positive.")
 
 
 def load_settings() -> Settings:
@@ -142,8 +124,6 @@ def load_settings() -> Settings:
         llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash-lite"),
         llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         ocr_backend=os.getenv("OCR_BACKEND", "vision"),
-        ocr_location=os.getenv("OCR_LOCATION", "us"),
-        doc_ai_processor_id=os.getenv("DOC_AI_PROCESSOR_ID", ""),
         max_image_bytes=int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024))),
         log_level=os.getenv("LOG_LEVEL", "WARNING"),
     )
@@ -173,10 +153,17 @@ class ConsentStatus(str, Enum):
 
 @dataclass
 class ConsentState:
-    """Per-source consent, carried in supervisor state across turns."""
+    """Per-source consent, carried across turns in supervisor state."""
 
     passport_ocr: ConsentStatus = ConsentStatus.NOT_ASKED
     chat_history: ConsentStatus = ConsentStatus.NOT_ASKED
+
+    def status_for(self, source: DataSource) -> ConsentStatus:
+        if source == DataSource.PASSPORT_OCR:
+            return self.passport_ocr
+        if source == DataSource.CHAT_HISTORY:
+            return self.chat_history
+        return ConsentStatus.GRANTED  # conversation needs no consent
 
     def awaiting_source(self) -> Optional[DataSource]:
         if self.passport_ocr == ConsentStatus.AWAITING:
@@ -186,33 +173,30 @@ class ConsentState:
         return None
 
 
-@dataclass(frozen=True)
-class NavigationTarget:
-    page_id: str
-    url_path: str
-    confident: bool
-
-
 @dataclass
 class FormFillCommand:
-    """Instruction the frontend applies to the website.
+    """Instruction the frontend applies to the website form.
 
-    BOUNDARY: there is intentionally NO submit field and NO DB handle. The
-    frontend opens ``navigate_to`` and writes ``field_values`` into inputs; the
-    user submits manually.
+    BOUNDARIES (structural): no submit action, no DB handles. The frontend
+    only opens a page and/or fills fields; the USER submits.
     """
 
-    navigate_to: Optional[NavigationTarget] = None
+    navigate_to: Optional[dict] = None            # {"page": str, "url": str}
     field_values: dict[str, str] = field(default_factory=dict)
-    source: Optional[DataSource] = None
+    source: Optional[str] = None                  # provenance for the UI note
+    # deliberately: NO `submit` field.
 
-    def is_empty(self) -> bool:
-        return self.navigate_to is None and not self.field_values
+    def to_dict(self) -> dict:
+        return {
+            "navigate_to": self.navigate_to,
+            "field_values": self.field_values,
+            "source": self.source,
+        }
 
 
 @dataclass
 class FormAssistantResult:
-    """What the register node returns to the supervisor."""
+    """What the register node returns to the supervisor / API."""
 
     answer: str
     command: Optional[FormFillCommand] = None
@@ -220,7 +204,7 @@ class FormAssistantResult:
 
 
 # ============================================================
-# 4. FIELD MAPPING (canonical keys -> frontend form field ids)
+# 4. FIELD MAPPING
 # ============================================================
 
 
@@ -238,7 +222,7 @@ CANONICAL_KEYS = {
 }
 
 
-# canonical_key -> frontend form field id (placeholders; swap for real ids).
+# canonical_key -> frontend form field id (PLACEHOLDER ids; swap for real ones)
 FIELD_MAP: dict[str, str] = {
     "surname": "reg_surname",
     "given_name": "reg_given_name",
@@ -282,355 +266,55 @@ def map_to_form_fields(canonical: dict[str, str]) -> dict[str, str]:
 
 
 # ============================================================
-# 5. NAVIGATION INTENT
+# 5. NAVIGATION
 # ============================================================
 
 
-NAV_PROMPT = """You detect website navigation requests for a tourism site.
-
-Known pages: {pages}
-
-If the user's message asks to open / go to / navigate to a page, respond with
-ONLY that page id (one of the known pages). If the request is about
-registering or filling the registration form, respond with: registration
-If no navigation is requested, respond with exactly: none
-
-USER MESSAGE:
-{message}
-
-PAGE:"""
-
-
-def detect_navigation_intent(
-    llm: ChatVertexAI,
-    message: str,
-    settings: Settings,
-) -> Optional[NavigationTarget]:
-    """Return a NavigationTarget if the user asked to open a page, else None."""
-
-    prompt = NAV_PROMPT.format(
-        pages=", ".join(settings.known_pages),
-        message=message,
-    )
-
-    try:
-        response = llm.invoke(prompt)
-        label = (response.content or "").strip().lower()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Navigation detection failed: %s", exc)
-        return None
-
-    label = re.sub(r"[^a-z_]", "", label)
-
-    if label in ("", "none"):
-        return None
-
-    if label in settings.known_pages:
-        path = (
-            settings.registration_path
-            if label == "registration"
-            else f"/{label}"
-        )
-        return NavigationTarget(page_id=label, url_path=path, confident=True)
-
-    # Model returned something unexpected -> ask the user to confirm.
-    return NavigationTarget(page_id="registration",
-                            url_path=settings.registration_path,
-                            confident=False)
-
-
-# ============================================================
-# 6. FIELD EXTRACTION (conversation + history)
-# ============================================================
-
-
-_EXTRACT_KEYS_LIST = ", ".join(sorted(CANONICAL_KEYS))
-
-EXTRACT_PROMPT = """You extract registration form values from text.
-
-Return ONLY a JSON object mapping canonical keys to string values. Use ONLY
-these keys (omit any you cannot find): {keys}
-
-Rules:
-- Do NOT invent values. Only include what is clearly stated.
-- Dates must be ISO format YYYY-MM-DD.
-- gender: "Male" or "Female".
-- Return {{}} if nothing is found. No prose, no markdown.
-
-TEXT:
-{text}
-
-JSON:"""
-
-
-def _parse_json_object(raw: str) -> dict[str, str]:
-    """Extract a JSON object from an LLM response, tolerant of code fences."""
-
-    cleaned = raw.strip()
-    cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"```$", "", cleaned).strip()
-
-    # Grab the first {...} block if there's surrounding text.
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if not match:
-        return {}
-
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-
-    if not isinstance(data, dict):
-        return {}
-
-    # Keep only known canonical keys with non-empty string values.
-    result: dict[str, str] = {}
-    for key, value in data.items():
-        if key in CANONICAL_KEYS and isinstance(value, str) and value.strip():
-            result[key] = value.strip()
-    return result
-
-
-def extract_fields_from_message(llm: ChatVertexAI, message: str) -> dict[str, str]:
-    """LLM extracts canonical field values from the current message."""
-
-    prompt = EXTRACT_PROMPT.format(keys=_EXTRACT_KEYS_LIST, text=message)
-
-    try:
-        response = llm.invoke(prompt)
-    except Exception as exc:  # noqa: BLE001
-        raise ExtractionError(f"Field extraction failed: {exc}") from exc
-
-    return _parse_json_object(response.content or "")
-
-
-def extract_fields_from_history(
-    llm: ChatVertexAI,
-    history: list[dict],
-) -> dict[str, str]:
-    """Consent-gated: mine prior chat turns for reusable field values."""
-
-    transcript = "\n".join(
-        f"{turn.get('role', 'user')}: {turn.get('content', '')}"
-        for turn in history
-    )
-
-    prompt = EXTRACT_PROMPT.format(keys=_EXTRACT_KEYS_LIST, text=transcript)
-
-    try:
-        response = llm.invoke(prompt)
-    except Exception as exc:  # noqa: BLE001
-        raise ExtractionError(f"History extraction failed: {exc}") from exc
-
-    return _parse_json_object(response.content or "")
-
-
-# ============================================================
-# 7. OCR PIPELINE (GCP Cloud Vision + passport parsing)
-# ============================================================
-
-
-def build_ocr_client(settings: Settings):
-    """Create the GCP OCR client using ADC (keyless)."""
-
-    if settings.ocr_backend != "vision":
-        raise ConfigurationError(
-            "Only the 'vision' OCR backend is implemented in this POC."
-        )
-
-    from google.cloud import vision  # imported lazily to keep startup light
-
-    logger.info("Initializing Cloud Vision OCR client")
-    return vision.ImageAnnotatorClient()
-
-
-def run_passport_ocr(client, image_bytes: bytes, settings: Settings) -> str:
-    """Invoke Cloud Vision document_text_detection and return the full text.
-
-    Does NOT persist the image. Raises OcrQualityError if the text is too
-    sparse to be a passport, OcrError on a service failure.
-    """
-
-    if not image_bytes:
-        raise OcrQualityError("No image provided.")
-
-    if len(image_bytes) > settings.max_image_bytes:
-        raise OcrError("Image exceeds the maximum allowed size.")
-
-    from google.cloud import vision
-
-    try:
-        image = vision.Image(content=image_bytes)
-        response = client.document_text_detection(image=image)
-    except Exception as exc:  # noqa: BLE001
-        raise OcrError(f"OCR service call failed: {exc}") from exc
-
-    if response.error.message:
-        raise OcrError(response.error.message)
-
-    text = response.full_text_annotation.text or ""
-
-    if len(text.strip()) < 20:
-        raise OcrQualityError("OCR text too sparse to be a passport.")
-
-    return text
-
-
-# ---- passport / MRZ parsing --------------------------------------------
-
-
-_MRZ_LINE = re.compile(r"^[A-Z0-9<]{30,44}$")
-
-
-def _mrz_date_to_iso(yymmdd: str, *, expiry: bool = False) -> Optional[str]:
-    """Convert an MRZ YYMMDD date to ISO YYYY-MM-DD (best-effort century)."""
-
-    if not re.fullmatch(r"\d{6}", yymmdd):
-        return None
-
-    yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
-    if not (1 <= mm <= 12 and 1 <= dd <= 31):
-        return None
-
-    # Expiry dates are future-leaning; birth dates are past-leaning.
-    century = 2000 if (expiry or yy <= (datetime.now().year % 100)) else 1900
-    if not expiry and 2000 + yy > datetime.now().year:
-        century = 1900
-    return f"{century + yy:04d}-{mm:02d}-{dd:02d}"
-
-
-def _parse_mrz(lines: list[str]) -> dict[str, str]:
-    """Parse a TD3 (passport) MRZ: two 44-char lines."""
-
-    mrz = [ln for ln in lines if _MRZ_LINE.match(ln)]
-    if len(mrz) < 2:
-        return {}
-
-    line1, line2 = mrz[-2], mrz[-1]
-    result: dict[str, str] = {}
-
-    # Line 1: P<ISSUER SURNAME<<GIVEN<NAMES
-    if line1.startswith("P"):
-        issuer = line1[2:5].replace("<", "")
-        if issuer:
-            result["passport_issuing_country"] = issuer
-        name_field = line1[5:]
-        if "<<" in name_field:  # surname<<given separator
-            surname_raw, given_raw = name_field.split("<<", 1)
-            surname = surname_raw.replace("<", " ").strip()
-            given = given_raw.replace("<", " ").strip()
-            if surname:
-                result["surname"] = surname.title()
-            if given:
-                result["given_name"] = given.title()
-        else:
-            names = name_field.replace("<", " ").strip()
-            if names:
-                result["full_name"] = names.title()
-
-    # Line 2: passport_no(9) chk nat(3) dob(6) chk sex expiry(6) ...
-    if len(line2) >= 28:
-        passport_no = line2[0:9].replace("<", "")
-        nationality = line2[10:13].replace("<", "")
-        dob = line2[13:19]
-        sex = line2[20:21]
-        expiry = line2[21:27]
-
-        if passport_no:
-            result["passport_no"] = passport_no
-        if nationality:
-            result["nationality"] = nationality
-        dob_iso = _mrz_date_to_iso(dob)
-        if dob_iso:
-            result["date_of_birth"] = dob_iso
-        if sex in ("M", "F"):
-            result["gender"] = "Male" if sex == "M" else "Female"
-        exp_iso = _mrz_date_to_iso(expiry, expiry=True)
-        if exp_iso:
-            result["passport_expiry_date"] = exp_iso
-
-    return result
-
-
-def parse_passport_fields(ocr_text: str) -> dict[str, str]:
-    """Parse OCR text into canonical passport fields (MRZ preferred)."""
-
-    if not ocr_text or not ocr_text.strip():
-        return {}
-
-    lines = [ln.strip().upper() for ln in ocr_text.splitlines() if ln.strip()]
-
-    result = _parse_mrz(lines)
-
-    # Fallback: labeled-line heuristics for anything MRZ didn't yield.
-    if "passport_no" not in result:
-        for ln in lines:
-            m = re.search(r"(?:PASSPORT\s*(?:NO|NUMBER)|DOCUMENT\s*NO)\D*([A-Z0-9]{6,})", ln)
-            if m:
-                result["passport_no"] = m.group(1)
-                break
-
-    return {k: v for k, v in result.items() if k in CANONICAL_KEYS}
-
-
-# ============================================================
-# 8. CONSENT HANDLING
-# ============================================================
-
-
-_CONSENT_PROMPTS = {
-    DataSource.PASSPORT_OCR: (
-        "I can read your passport photo to fill in the form. Your image is "
-        "used only to extract the details and is not saved. Shall I go ahead? "
-        "(yes/no)"
-    ),
-    DataSource.CHAT_HISTORY: (
-        "I can reuse the details you already shared in our chat (name, dates, "
-        "etc.) to fill the form. Would you like me to do that? (yes/no)"
-    ),
+_PAGE_KEYWORDS = {
+    "packages": ["packages", "package", "itinerary", "itineraries", "trip",
+                 "tour", "browse packages"],
+    "calendar": ["calendar", "festival calendar", "dates", "schedule"],
+    "flagship": ["flagship", "flagship festival", "main festival"],
+    "heritage": ["heritage", "history", "historic", "culture"],
+    "stopover": ["stopover", "stop over", "layover"],
+    "closing": ["closing", "strategy", "plan"],
+    "home": ["home", "homepage", "main page", "top", "landing"],
 }
 
 
-def request_consent(source: DataSource) -> str:
-    return _CONSENT_PROMPTS.get(source, "Do you consent? (yes/no)")
+def detect_navigation_intent(message: str) -> Optional[dict]:
+    """Return {"page", "url"} if the message names a known page, else None.
 
+    First tries to deep-link to a specific festival registration page
+    (/packages/<slug>); otherwise resolves a landing-page section.
+    """
 
-def interpret_consent_reply(message: str) -> Optional[bool]:
-    """Return True (yes), False (no), or None (not a clear yes/no)."""
+    lowered = message.lower()
 
-    text = message.strip().lower()
-    if re.search(r"\b(yes|yeah|yep|sure|ok|okay|go ahead|please do|do it)\b", text):
-        return True
-    if re.search(r"\b(no|nope|don't|do not|stop|cancel|nah)\b", text):
-        return False
+    # 1) Specific package/festival deep-link (path-based /packages/<slug>).
+    slug = match_package_slug(lowered)
+    if slug:
+        return {"page": f"package_{slug}", "url": festival_register_url(slug)}
+
+    # 2) Landing-page section.
+    for page_id, keywords in _PAGE_KEYWORDS.items():
+        if any(kw in lowered for kw in keywords) and page_id in SITE_PAGES:
+            return {"page": page_id, "url": SITE_PAGES[page_id]}
     return None
 
 
-def update_consent(
-    state: ConsentState,
-    source: DataSource,
-    granted: bool,
-) -> ConsentState:
-    status = ConsentStatus.GRANTED if granted else ConsentStatus.DENIED
-    if source == DataSource.PASSPORT_OCR:
-        state.passport_ocr = status
-    elif source == DataSource.CHAT_HISTORY:
-        state.chat_history = status
-    return state
-
-
 # ============================================================
-# 9. FILL-SOURCE INTENT
+# 6. FILL-SOURCE + FIELD EXTRACTION (LLM)
 # ============================================================
 
 
-FILL_SOURCE_PROMPT = """Classify what the user wants for filling a form.
+_FILL_SOURCE_PROMPT = """Classify how the user wants to fill the registration form.
 
-Respond with ONE word:
-- passport_ocr : they want to use / read their passport image
-- chat_history : they want to reuse what they already told you in the chat
-- conversation : they are stating field values right now in this message
-- none         : none of the above
+Respond with ONLY one word:
+- "passport_ocr" : they want to use / upload / scan their passport image.
+- "chat_history" : they want to reuse what they already told you earlier.
+- "conversation" : they are dictating field values in this message.
+- "none"         : no form-fill request.
 
 USER MESSAGE:
 {message}
@@ -639,73 +323,362 @@ ANSWER:"""
 
 
 def classify_fill_source(llm: ChatVertexAI, message: str) -> DataSource:
+    """Decide which data source the user is asking to fill from."""
+
+    lowered = message.lower()
+
+    # Fast keyword hints.
+    if any(k in lowered for k in ["passport", "scan", "upload my passport"]):
+        return DataSource.PASSPORT_OCR
+    if any(k in lowered for k in ["already told", "what i said", "from our chat",
+                                  "use my details", "reuse"]):
+        return DataSource.CHAT_HISTORY
+
     try:
-        response = llm.invoke(FILL_SOURCE_PROMPT.format(message=message))
+        response = llm.invoke(_FILL_SOURCE_PROMPT.format(message=message))
         label = (response.content or "").strip().lower()
     except Exception as exc:  # noqa: BLE001
         logger.error("Fill-source classification failed: %s", exc)
         return DataSource.NONE
 
-    for src in (DataSource.PASSPORT_OCR, DataSource.CHAT_HISTORY,
-                DataSource.CONVERSATION):
-        if src.value in label:
-            return src
+    for source in DataSource:
+        if source.value in label:
+            return source
     return DataSource.NONE
 
 
+_EXTRACT_KEYS = ", ".join(sorted(CANONICAL_KEYS))
+
+_EXTRACT_MESSAGE_PROMPT = """Extract registration field values from the user's message.
+
+Return ONLY a compact JSON object mapping canonical keys to string values.
+Allowed keys: {keys}
+
+Rules:
+- Only include keys the user actually provided. Omit everything else.
+- Normalize dates to ISO YYYY-MM-DD when possible.
+- Do NOT invent values. Output {{}} if nothing is present.
+
+USER MESSAGE:
+{message}
+
+JSON:"""
+
+_EXTRACT_HISTORY_PROMPT = """Extract reusable registration field values from the
+conversation so far.
+
+Return ONLY a compact JSON object mapping canonical keys to string values.
+Allowed keys: {keys}
+
+Rules:
+- Only include values the user ALREADY provided in the conversation.
+- Do NOT invent values. Output {{}} if nothing is present.
+- Normalize dates to ISO YYYY-MM-DD when possible.
+
+CONVERSATION:
+{history}
+
+JSON:"""
+
+
+def _parse_json_object(raw: str) -> dict[str, str]:
+    """Best-effort parse of an LLM JSON object response into str->str."""
+
+    import json
+
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+
+    # Extract the first {...} block if the model added prose.
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        text = match.group(0)
+
+    try:
+        data = json.loads(text or "{}")
+    except (ValueError, TypeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    # Keep only canonical keys with non-empty string values.
+    result: dict[str, str] = {}
+    for key, value in data.items():
+        if key in CANONICAL_KEYS and value not in (None, ""):
+            result[key] = str(value).strip()
+    return result
+
+
+def extract_fields_from_message(llm: ChatVertexAI, message: str) -> dict[str, str]:
+    """LLM extracts canonical field values from the current message."""
+
+    try:
+        response = llm.invoke(
+            _EXTRACT_MESSAGE_PROMPT.format(keys=_EXTRACT_KEYS, message=message)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ExtractionError(f"Field extraction failed: {exc}") from exc
+
+    return _parse_json_object(response.content)
+
+
+def extract_fields_from_history(
+    llm: ChatVertexAI, history: list[dict]
+) -> dict[str, str]:
+    """Consent-gated: mine prior chat turns for reusable field values."""
+
+    transcript = "\n".join(
+        f"{turn.get('role', 'user')}: {turn.get('content', '')}"
+        for turn in (history or [])
+    )
+
+    if not transcript.strip():
+        return {}
+
+    try:
+        response = llm.invoke(
+            _EXTRACT_HISTORY_PROMPT.format(keys=_EXTRACT_KEYS, history=transcript)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ExtractionError(f"History extraction failed: {exc}") from exc
+
+    return _parse_json_object(response.content)
+
+
 # ============================================================
-# 10. FORM ASSISTANT SERVICE
+# 7. OCR PIPELINE (GCP Cloud Vision + passport parsing)
 # ============================================================
 
 
-def summarize_command(command: FormFillCommand) -> str:
-    """Human-friendly summary of what the bot filled (never mentions submit)."""
+def build_ocr_client(settings: Settings):
+    """Create a Cloud Vision client (keyless ADC). Imported lazily."""
 
+    from google.cloud import vision
+
+    return vision.ImageAnnotatorClient()
+
+
+def run_passport_ocr(client, image_bytes: bytes, settings: Settings) -> str:
+    """Run Cloud Vision document_text_detection; return full text incl. MRZ.
+
+    Preconditions: consent granted (enforced by caller); non-empty image within
+    the size limit. Does NOT persist the image.
+    """
+
+    if not image_bytes:
+        raise OcrQualityError("No image provided.")
+    if len(image_bytes) > settings.max_image_bytes:
+        raise OcrQualityError("Image is too large.")
+
+    from google.cloud import vision
+
+    try:
+        image = vision.Image(content=image_bytes)
+        response = client.document_text_detection(image=image)
+    except Exception as exc:  # noqa: BLE001
+        raise OcrError(f"OCR service error: {exc}") from exc
+
+    if response.error.message:
+        raise OcrError(response.error.message)
+
+    text = response.full_text_annotation.text if response.full_text_annotation else ""
+
+    if len(text.strip()) < 20:
+        raise OcrQualityError("Could not read enough text from the image.")
+
+    return text
+
+
+# --- MRZ (TD3 passport) parsing -------------------------------------------
+
+_MRZ_COUNTRY_TO_NAME = {
+    "IND": "Indian", "USA": "American", "GBR": "British", "DEU": "German",
+    "FRA": "French", "KEN": "Kenyan", "ETH": "Ethiopian",
+}
+
+
+def _mrz_date_to_iso(yymmdd: str, expiry: bool = False) -> Optional[str]:
+    """Convert MRZ YYMMDD to ISO YYYY-MM-DD with a century heuristic."""
+
+    if not re.fullmatch(r"\d{6}", yymmdd):
+        return None
+    yy, mm, dd = int(yymmdd[:2]), yymmdd[2:4], yymmdd[4:6]
+    # DOB: 20xx if <= current 2-digit year else 19xx. Expiry: always 20xx.
+    now_yy = datetime.now().year % 100
+    century = 2000 if (expiry or yy <= now_yy) else 1900
+    year = century + yy
+    try:
+        datetime(year, int(mm), int(dd))
+    except ValueError:
+        return None
+    return f"{year:04d}-{mm}-{dd}"
+
+
+def parse_passport_fields(ocr_text: str) -> dict[str, str]:
+    """Parse OCR text into canonical passport fields (MRZ preferred)."""
+
+    fields: dict[str, str] = {}
+
+    # Find TD3 MRZ: two lines of ~44 chars using A-Z0-9<.
+    mrz_lines = [
+        ln.replace(" ", "")
+        for ln in ocr_text.splitlines()
+        if re.fullmatch(r"[A-Z0-9<]{30,44}", ln.replace(" ", ""))
+    ]
+
+    if len(mrz_lines) >= 2:
+        line1, line2 = mrz_lines[-2], mrz_lines[-1]
+
+        # Line 1: P<ISSUING<SURNAME<<GIVEN<NAMES
+        m = re.match(r"P[A-Z<]?([A-Z]{3})(.+)", line1)
+        if m:
+            issuing = m.group(1)
+            fields["passport_issuing_country"] = _MRZ_COUNTRY_TO_NAME.get(
+                issuing, issuing
+            )
+            names = m.group(2)
+            if "<<" in names:
+                surname_part, given_part = names.split("<<", 1)
+                surname = surname_part.replace("<", " ").strip()
+                given = given_part.replace("<", " ").strip()
+                if surname:
+                    fields["surname"] = surname.title()
+                if given:
+                    fields["given_name"] = given.title()
+                if surname or given:
+                    fields["full_name"] = f"{given.title()} {surname.title()}".strip()
+
+        # Line 2: passport_no(9) chk(1) nationality(3) dob(6) chk sex(1) exp(6)...
+        if len(line2) >= 28:
+            passport_no = line2[0:9].replace("<", "").strip()
+            nationality = line2[10:13]
+            dob = line2[13:19]
+            sex = line2[20:21]
+            expiry = line2[21:27]
+
+            if passport_no:
+                fields["passport_no"] = passport_no
+            if re.fullmatch(r"[A-Z]{3}", nationality):
+                fields["nationality"] = _MRZ_COUNTRY_TO_NAME.get(
+                    nationality, nationality
+                )
+            dob_iso = _mrz_date_to_iso(dob)
+            if dob_iso:
+                fields["date_of_birth"] = dob_iso
+            if sex in ("M", "F"):
+                fields["gender"] = "Male" if sex == "M" else "Female"
+            exp_iso = _mrz_date_to_iso(expiry, expiry=True)
+            if exp_iso:
+                fields["passport_expiry_date"] = exp_iso
+
+    # Fallback: labeled-line heuristics for anything MRZ didn't yield.
+    if "passport_no" not in fields:
+        m = re.search(r"passport\s*(?:no|number)[:\s]+([A-Z0-9]{6,10})",
+                      ocr_text, re.IGNORECASE)
+        if m:
+            fields["passport_no"] = m.group(1).upper()
+
+    return fields
+
+
+# ============================================================
+# 8. CONSENT
+# ============================================================
+
+
+def request_consent(source: DataSource) -> str:
+    if source == DataSource.PASSPORT_OCR:
+        return (
+            "I can read your passport image to fill the form. Your image is "
+            "used only to extract the details and is not saved. Do you consent? "
+            "(yes/no)"
+        )
+    if source == DataSource.CHAT_HISTORY:
+        return (
+            "I can reuse the details you already shared in our chat (like name "
+            "and travel dates) to fill the form. Is that okay? (yes/no)"
+        )
+    return "Do you want me to proceed? (yes/no)"
+
+
+def interpret_consent_reply(message: str) -> Optional[bool]:
+    """Return True (yes), False (no), or None (not a clear yes/no)."""
+
+    lowered = message.strip().lower()
+    if lowered in {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "please do",
+                   "go ahead", "confirm"}:
+        return True
+    if lowered in {"no", "n", "nope", "don't", "dont", "cancel", "stop"}:
+        return False
+    if re.search(r"\b(yes|sure|okay|ok|go ahead|proceed)\b", lowered):
+        return True
+    if re.search(r"\b(no|don't|dont|cancel|stop|nope)\b", lowered):
+        return False
+    return None
+
+
+def update_consent(
+    state: ConsentState, source: DataSource, granted: bool
+) -> ConsentState:
+    status = ConsentStatus.GRANTED if granted else ConsentStatus.DENIED
+    if source == DataSource.PASSPORT_OCR:
+        return ConsentState(passport_ocr=status, chat_history=state.chat_history)
+    if source == DataSource.CHAT_HISTORY:
+        return ConsentState(passport_ocr=state.passport_ocr, chat_history=status)
+    return state
+
+
+# ============================================================
+# 9. FORM ASSISTANT SERVICE
+# ============================================================
+
+
+def _summarize_command(command: FormFillCommand) -> str:
     parts = []
-    if command.navigate_to is not None:
-        parts.append(f"opened the {command.navigate_to.page_id} page")
+    if command.navigate_to:
+        page = command.navigate_to["page"].replace("_", " ")
+        parts.append(f"opening the {page} page")
     if command.field_values:
         n = len(command.field_values)
-        parts.append(f"filled in {n} field{'s' if n != 1 else ''}")
+        src = f" from your {command.source.replace('_', ' ')}" if command.source else ""
+        parts.append(f"filling {n} field(s){src}")
 
     if not parts:
-        return "I didn't catch any details to fill. Could you restate them?"
+        return (
+            "Tell me what you'd like to enter, or say 'use my passport' or "
+            "'use what I already told you' and I'll help fill the form."
+        )
 
-    action = " and ".join(parts)
     return (
-        f"I've {action}. Please review everything and submit the form yourself "
-        "when it looks right."
+        "I've " + " and ".join(parts) + ". Please review the details and submit "
+        "the form yourself when you're happy with them."
     )
 
 
 @dataclass
 class FormAssistant:
-    """Drives the registration form from chat. Never writes DB, never submits."""
+    """Navigates + fills the registration form. Never writes DB, never submits."""
 
     settings: Settings
     llm: ChatVertexAI
-    ocr_client: object = None
+    ocr_client: object
 
     @classmethod
     def bootstrap(cls, settings: Optional[Settings] = None) -> "FormAssistant":
         settings = settings or load_settings()
 
-        logger.info("Initializing Gemini model '%s'", settings.llm_model)
+        logger.info("Initializing form assistant (Gemini + Vision, ADC)")
         llm = ChatVertexAI(
             model=settings.llm_model,
             temperature=settings.llm_temperature,
             project=settings.gcp_project_id,
             location=settings.gcp_location,
         )
+        ocr_client = build_ocr_client(settings)
 
-        # OCR client is built lazily on first passport use to keep startup fast
-        # and avoid requiring the Vision API unless it's actually needed.
-        return cls(settings=settings, llm=llm, ocr_client=None)
-
-    def _ensure_ocr_client(self):
-        if self.ocr_client is None:
-            self.ocr_client = build_ocr_client(self.settings)
-        return self.ocr_client
+        return cls(settings=settings, llm=llm, ocr_client=ocr_client)
 
     def handle(
         self,
@@ -716,159 +689,131 @@ class FormAssistant:
         image_bytes: Optional[bytes] = None,
         consent: Optional[ConsentState] = None,
     ) -> FormAssistantResult:
-        """Route a form-fill turn. Returns text + FormFillCommand.
+        """See design pseudocode. Returns text + FormFillCommand.
 
-        Never writes to the DB and never submits the form.
+        Never opens a DB session; never includes a submit action.
         """
 
-        history = history or []
         consent = consent or ConsentState()
+        history = history or []
         command = FormFillCommand()
 
         # 1) Navigation (independent of consent).
-        nav = detect_navigation_intent(self.llm, message, self.settings)
-        if nav is not None:
-            if not nav.confident:
-                return FormAssistantResult(
-                    "Which page did you mean? For example: "
-                    f"{', '.join(self.settings.known_pages)}.",
-                    command,
-                    consent,
-                )
+        nav = detect_navigation_intent(message)
+        if nav:
             command.navigate_to = nav
 
-        # 2) If awaiting a consent answer, interpret yes/no first.
+        # 2) If awaiting a consent answer, resolve yes/no first.
         awaiting = consent.awaiting_source()
         if awaiting is not None:
             decision = interpret_consent_reply(message)
             if decision is None:
                 return FormAssistantResult(
-                    "Please answer yes or no.", command, consent
+                    "Please answer yes or no so I know how to proceed.",
+                    command if command.navigate_to else None,
+                    consent,
                 )
             consent = update_consent(consent, awaiting, decision)
             if not decision:
                 return FormAssistantResult(
-                    "Okay, I won't use that. You can fill it in yourself, or "
-                    "tell me the details directly.",
-                    command,
+                    "Okay, I won't use that. You can fill the form in yourself, "
+                    "or tell me the details and I'll enter them.",
+                    command if command.navigate_to else None,
                     consent,
                 )
-            # Granted -> perform that source's fill now.
-            return self._perform_fill(awaiting, message, history,
-                                      image_bytes, command, consent)
+            # granted -> perform that source's fill below.
+            source = awaiting
+        else:
+            source = classify_fill_source(self.llm, message)
 
-        # 3) Determine the requested fill source from the message.
-        intent = classify_fill_source(self.llm, message)
-
-        if intent == DataSource.PASSPORT_OCR:
-            if consent.passport_ocr != ConsentStatus.GRANTED:
-                consent.passport_ocr = ConsentStatus.AWAITING
-                return FormAssistantResult(
-                    request_consent(DataSource.PASSPORT_OCR), command, consent
-                )
-            return self._perform_fill(DataSource.PASSPORT_OCR, message,
-                                      history, image_bytes, command, consent)
-
-        if intent == DataSource.CHAT_HISTORY:
-            if consent.chat_history != ConsentStatus.GRANTED:
-                consent.chat_history = ConsentStatus.AWAITING
-                return FormAssistantResult(
-                    request_consent(DataSource.CHAT_HISTORY), command, consent
-                )
-            return self._perform_fill(DataSource.CHAT_HISTORY, message,
-                                      history, image_bytes, command, consent)
-
-        if intent == DataSource.CONVERSATION:
-            return self._perform_fill(DataSource.CONVERSATION, message,
-                                      history, image_bytes, command, consent)
-
-        # No fill intent — just navigation, or nothing actionable.
-        if command.navigate_to is not None:
-            return FormAssistantResult(
-                summarize_command(command), command, consent
-            )
-        return FormAssistantResult(
-            "I can open the registration page and help fill the form. You can "
-            "dictate details, upload your passport, or reuse our chat history.",
-            command,
-            consent,
-        )
-
-    def _perform_fill(
-        self,
-        source: DataSource,
-        message: str,
-        history: list[dict],
-        image_bytes: Optional[bytes],
-        command: FormFillCommand,
-        consent: ConsentState,
-    ) -> FormAssistantResult:
-        """Execute the fill for a source. Consent for gated sources is GRANTED."""
-
+        # 3a) Passport OCR (consent gate).
         if source == DataSource.PASSPORT_OCR:
+            if consent.passport_ocr != ConsentStatus.GRANTED:
+                consent = ConsentState(
+                    passport_ocr=ConsentStatus.AWAITING,
+                    chat_history=consent.chat_history,
+                )
+                return FormAssistantResult(
+                    request_consent(DataSource.PASSPORT_OCR),
+                    command if command.navigate_to else None,
+                    consent,
+                )
             assert consent.passport_ocr == ConsentStatus.GRANTED
             if not image_bytes:
                 return FormAssistantResult(
-                    "Please upload your passport image first, then ask again.",
-                    command,
+                    "Please upload your passport image and I'll read it.",
+                    command if command.navigate_to else None,
                     consent,
                 )
             try:
-                text = run_passport_ocr(
-                    self._ensure_ocr_client(), image_bytes, self.settings
-                )
+                text = run_passport_ocr(self.ocr_client, image_bytes, self.settings)
                 canonical = parse_passport_fields(text)
             except OcrQualityError:
                 return FormAssistantResult(
-                    "I couldn't read the passport clearly. Please try a "
-                    "sharper, well-lit photo.",
-                    command,
+                    "I couldn't read the passport clearly. Please try a sharper, "
+                    "well-lit photo.",
+                    command if command.navigate_to else None,
                     consent,
                 )
-            except OcrError as exc:
-                logger.error("OCR error: %s", exc)
+            except OcrError:
                 return FormAssistantResult(
-                    "Passport reading is unavailable right now. You can type "
-                    "the details instead.",
-                    command,
+                    "Passport reading is unavailable right now. You can type the "
+                    "details instead.",
+                    command if command.navigate_to else None,
                     consent,
                 )
+            finally:
+                image_bytes = None  # transient: never persisted
             command.field_values = map_to_form_fields(canonical)
-            command.source = DataSource.PASSPORT_OCR
+            command.source = DataSource.PASSPORT_OCR.value
 
+        # 3b) Chat history (consent gate).
         elif source == DataSource.CHAT_HISTORY:
+            if consent.chat_history != ConsentStatus.GRANTED:
+                consent = ConsentState(
+                    passport_ocr=consent.passport_ocr,
+                    chat_history=ConsentStatus.AWAITING,
+                )
+                return FormAssistantResult(
+                    request_consent(DataSource.CHAT_HISTORY),
+                    command if command.navigate_to else None,
+                    consent,
+                )
             assert consent.chat_history == ConsentStatus.GRANTED
             try:
                 canonical = extract_fields_from_history(self.llm, history)
-            except ExtractionError as exc:
-                logger.error("History extraction error: %s", exc)
+            except ExtractionError:
                 return FormAssistantResult(
-                    "I couldn't pull details from our chat. Please restate "
-                    "them and I'll fill the form.",
-                    command,
+                    "I couldn't pull details from our chat. Please tell me what "
+                    "to enter.",
+                    command if command.navigate_to else None,
                     consent,
                 )
             command.field_values = map_to_form_fields(canonical)
-            command.source = DataSource.CHAT_HISTORY
+            command.source = DataSource.CHAT_HISTORY.value
 
+        # 3c) Conversational (no consent needed).
         elif source == DataSource.CONVERSATION:
             try:
                 canonical = extract_fields_from_message(self.llm, message)
-            except ExtractionError as exc:
-                logger.error("Message extraction error: %s", exc)
-                return FormAssistantResult(
-                    "I couldn't process those details. Could you restate them?",
-                    command,
-                    consent,
-                )
+            except ExtractionError:
+                canonical = {}
             command.field_values = map_to_form_fields(canonical)
-            command.source = DataSource.CONVERSATION
+            if command.field_values:
+                command.source = DataSource.CONVERSATION.value
 
-        return FormAssistantResult(summarize_command(command), command, consent)
+        # 4) Compose reply. NEVER submit; NEVER write DB.
+        has_command = bool(command.navigate_to or command.field_values)
+        answer = _summarize_command(command)
+        return FormAssistantResult(
+            answer,
+            command if has_command else None,
+            consent,
+        )
 
 
 # ============================================================
-# 11. CLI
+# 10. CLI (standalone smoke test)
 # ============================================================
 
 
@@ -890,7 +835,8 @@ def main() -> int:
     print("\n===================================")
     print(" Registration Form Assistant")
     print("===================================")
-    print("Text-only demo (passport OCR needs the Streamlit UI for uploads).")
+    print("Try: 'take me to registration', 'use my passport', "
+          "'use what I already told you', or dictate fields.")
 
     consent = ConsentState()
     history: list[dict] = []
@@ -905,26 +851,21 @@ def main() -> int:
         if message.lower() in {"exit", "quit", "q"}:
             print("\nGoodbye!")
             return 0
-
         if not message:
             continue
 
         history.append({"role": "user", "content": message})
+        result = assistant.handle(message, history=history, consent=consent)
+        consent = result.consent
 
-        try:
-            result = assistant.handle(
-                message, history=history, consent=consent
-            )
-            consent = result.consent
-            print(f"\nAssistant: {result.answer}")
-            if result.command and result.command.field_values:
-                print(f"  [form-fill] {result.command.field_values}")
-            if result.command and result.command.navigate_to:
-                print(f"  [navigate]  {result.command.navigate_to.url_path}")
-            history.append({"role": "assistant", "content": result.answer})
-        except FormAssistantError as exc:
-            logger.error("Request failed: %s", exc)
-            print("\nAssistant: Sorry, something went wrong. Please try again.")
+        print(f"\nAssistant: {result.answer}")
+        if result.command:
+            if result.command.navigate_to:
+                print(f"  [navigate] {result.command.navigate_to['url']}")
+            if result.command.field_values:
+                print(f"  [fill] {result.command.field_values}")
+
+        history.append({"role": "assistant", "content": result.answer})
 
 
 if __name__ == "__main__":

@@ -59,6 +59,27 @@ class ChatRequest(BaseModel):
         default=None,
         description="Opaque client session id (reserved for future memory).",
     )
+    history: Optional[list[dict]] = Field(
+        default=None,
+        description=(
+            "Prior chat turns [{role, content}], used for the register route's "
+            "chat-history form-fill. The frontend maintains this."
+        ),
+    )
+    consent: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Consent state {passport_ocr, chat_history} echoed from the last "
+            "response; the frontend persists it across turns."
+        ),
+    )
+    image_base64: Optional[str] = Field(
+        default=None,
+        description=(
+            "Base64-encoded passport image for OCR (register route). Transient: "
+            "used only to extract fields, never stored."
+        ),
+    )
 
 
 class NavigationDirective(BaseModel):
@@ -70,6 +91,9 @@ class ChatResponse(BaseModel):
     answer: str
     route: str
     navigation: Optional[NavigationDirective] = None
+    # register-route extras:
+    command: Optional[dict] = None       # {navigate_to, field_values, source}
+    consent: Optional[dict] = None       # {passport_ocr, chat_history}
 
 
 # ============================================================
@@ -148,8 +172,23 @@ def chat(request: ChatRequest) -> ChatResponse:
             navigation=None,
         )
 
+    # Decode a transient passport image if provided (register route only).
+    image_bytes = None
+    if request.image_base64:
+        import base64
+        try:
+            image_bytes = base64.b64decode(request.image_base64)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to decode image_base64; ignoring.")
+
     try:
-        result = _get_supervisor().chat(message, user_id=request.user_id)
+        result = _get_supervisor().chat(
+            message,
+            user_id=request.user_id,
+            history=request.history,
+            image_bytes=image_bytes,
+            consent=request.consent,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("Chat request failed: %s", exc)
         return ChatResponse(
@@ -157,6 +196,8 @@ def chat(request: ChatRequest) -> ChatResponse:
             route="discovery",
             navigation=None,
         )
+    finally:
+        image_bytes = None  # do not retain image bytes
 
     navigation = (
         NavigationDirective(**result.navigation) if result.navigation else None
@@ -166,4 +207,6 @@ def chat(request: ChatRequest) -> ChatResponse:
         answer=result.answer,
         route=result.route,
         navigation=navigation,
+        command=result.command,
+        consent=result.consent,
     )
