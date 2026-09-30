@@ -141,7 +141,10 @@ _BLOCKED_TABLES = {"users", "admin_notifications"}
 # The only "tables" the LLM is allowed to reference are these per-user secured
 # views. They are materialized as CTEs (see build_secured_cte) that are
 # pre-filtered to the authenticated user's own data via a bound parameter.
-_SECURED_VIEWS = ("my_requests", "my_costs", "my_passengers", "my_visas")
+_SECURED_VIEWS = (
+    "my_requests", "my_costs", "my_passengers", "my_visas",
+    "my_flights", "my_hotels", "my_transport", "my_attractions",
+)
 
 
 def build_secured_cte() -> str:
@@ -168,6 +171,22 @@ def build_secured_cte() -> str:
         "my_visas AS (\n"
         "    SELECT v.* FROM visa_applications v\n"
         "    JOIN my_requests r ON v.package_request_id = r.id\n"
+        "),\n"
+        "my_flights AS (\n"
+        "    SELECT f.* FROM flight_bookings f\n"
+        "    JOIN my_requests r ON f.package_request_id = r.id\n"
+        "),\n"
+        "my_hotels AS (\n"
+        "    SELECT h.* FROM hotel_bookings h\n"
+        "    JOIN my_requests r ON h.package_request_id = r.id\n"
+        "),\n"
+        "my_transport AS (\n"
+        "    SELECT t.* FROM transport_bookings t\n"
+        "    JOIN my_requests r ON t.package_request_id = r.id\n"
+        "),\n"
+        "my_attractions AS (\n"
+        "    SELECT a.* FROM attraction_bookings a\n"
+        "    JOIN my_requests r ON a.package_request_id = r.id\n"
         ")"
     )
 
@@ -189,6 +208,10 @@ def build_user_schema_description(db_engine: Engine) -> str:
         "my_costs": "package_request_costs",
         "my_passengers": "package_request_passengers",
         "my_visas": "visa_applications",
+        "my_flights": "flight_bookings",
+        "my_hotels": "hotel_bookings",
+        "my_transport": "transport_bookings",
+        "my_attractions": "attraction_bookings",
     }
 
     lines: List[str] = []
@@ -233,7 +256,9 @@ def _strip_sql_markdown(raw: str) -> str:
 # Base tables the model must never name directly — it must use the my_* views.
 _PROTECTED_TABLE_REF = re.compile(
     r"\b(users|admin_notifications|package_requests|package_request_costs|"
-    r"package_request_passengers|visa_applications)\b",
+    r"package_request_passengers|visa_applications|flight_bookings|"
+    r"hotel_bookings|transport_bookings|attraction_bookings|"
+    r"visa_family_payments)\b",
     re.IGNORECASE,
 )
 
@@ -312,9 +337,10 @@ STRICT RULES:
 2. Output a single bare SELECT statement. Do NOT write a WITH/CTE clause and
    do NOT end with a semicolon.
 3. You may ONLY reference these views: my_requests, my_costs, my_passengers,
-   my_visas. These are already scoped to the current traveller.
+   my_visas, my_flights, my_hotels, my_transport, my_attractions. These are
+   already scoped to the current traveller.
 4. NEVER reference base tables such as users, package_requests,
-   admin_notifications, or any table not listed as a view.
+   flight_bookings, admin_notifications, or any table not listed as a view.
 5. NEVER use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, or PRAGMA.
 6. Prefer explicit JOINs on package_request_id = my_requests.id.
 7. Add a reasonable LIMIT if the result could be large.
