@@ -212,6 +212,9 @@ CANONICAL_KEYS = {
     # trip
     "arrival_date", "departure_date", "airline", "flight_number",
     "destinations", "purpose_of_visit", "port_of_entry",
+    # party composition
+    "adults_male", "adults_female", "children_count", "infants",
+    "travellers_total",
 }
 
 
@@ -242,6 +245,12 @@ FIELD_MAP: dict[str, str] = {
     "destinations": "reg_destinations",
     "purpose_of_visit": "reg_purpose_of_visit",
     "port_of_entry": "reg_port_of_entry",
+    # party composition (PLACEHOLDER ids; map to the real form field names)
+    "adults_male": "reg_adults_male",
+    "adults_female": "reg_adults_female",
+    "children_count": "reg_children_count",
+    "infants": "reg_infants",
+    "travellers_total": "reg_travellers_total",
 }
 
 
@@ -264,22 +273,27 @@ def map_to_form_fields(canonical: dict[str, str]) -> dict[str, str]:
 
 
 _PAGE_KEYWORDS = {
-    "packages": ["packages", "package", "itinerary", "itineraries", "trip",
-                 "tour", "browse packages"],
-    "calendar": ["calendar", "festival calendar", "dates", "schedule"],
-    "flagship": ["flagship", "flagship festival", "main festival"],
-    "heritage": ["heritage", "history", "historic", "culture"],
+    "packages": ["packages", "itineraries", "browse packages"],
+    "calendar": ["festival calendar", "calendar"],
+    "flagship": ["flagship festival", "flagship"],
+    "heritage": ["heritage page", "history page", "heritage"],
     "stopover": ["stopover", "stop over", "layover"],
-    "closing": ["closing", "strategy", "plan"],
-    "home": ["home", "homepage", "main page", "top", "landing"],
+    "closing": ["closing section", "strategy page"],
+    "home": ["homepage", "home page", "landing page"],
 }
+
+# Explicit navigation verbs — navigation is only triggered when the user
+# clearly asks to go somewhere, not on every form-fill message.
+_NAV_VERBS = ("navigate", "take me to", "open ", "go to", "show me the",
+              "redirect", "bring me to", "visit the")
 
 
 def detect_navigation_intent(message: str) -> Optional[dict]:
-    """Return {"page", "url"} if the message names a known page, else None.
+    """Return {"page", "url"} only when the user clearly wants to navigate.
 
-    First tries to deep-link to a specific festival registration page
-    (/packages/<slug>); otherwise resolves a landing-page section.
+    A specific package/festival name always deep-links. Otherwise a landing
+    section only matches when an explicit navigation verb is present, so
+    phrases like "we are planning..." don't accidentally navigate.
     """
 
     lowered = message.lower()
@@ -289,7 +303,10 @@ def detect_navigation_intent(message: str) -> Optional[dict]:
     if slug:
         return {"page": f"package_{slug}", "url": festival_register_url(slug)}
 
-    # 2) Landing-page section.
+    # 2) Landing-page section — ONLY if the user used a navigation verb.
+    if not any(verb in lowered for verb in _NAV_VERBS):
+        return None
+
     for page_id, keywords in _PAGE_KEYWORDS.items():
         if any(kw in lowered for kw in keywords) and page_id in SITE_PAGES:
             return {"page": page_id, "url": SITE_PAGES[page_id]}
@@ -304,10 +321,18 @@ def detect_navigation_intent(message: str) -> Optional[dict]:
 _FILL_SOURCE_PROMPT = """Classify how the user wants to fill the registration form.
 
 Respond with ONLY one word:
-- "passport_ocr" : they want to use / upload / scan their passport image.
-- "chat_history" : they want to reuse what they already told you earlier.
-- "conversation" : they are dictating field values in this message.
-- "none"         : no form-fill request.
+- "passport_ocr" : they explicitly want to use/upload/scan a passport image.
+- "chat_history" : they explicitly want to reuse what they told you earlier.
+- "conversation" : they ask to fill the form AND/OR give any traveller details
+                   in this message (names, number of people, dates, nationality,
+                   etc.). This is the default whenever they want help filling it.
+- "none"         : the message is unrelated to filling a form.
+
+Examples:
+- "can you fill this form for me, we are 3 people" -> conversation
+- "fill the form, 1 man and 2 women" -> conversation
+- "use my passport" -> passport_ocr
+- "use what I told you earlier" -> chat_history
 
 USER MESSAGE:
 {message}
@@ -350,6 +375,14 @@ Allowed keys: {keys}
 Rules:
 - Only include keys the user actually provided. Omit everything else.
 - Normalize dates to ISO YYYY-MM-DD when possible.
+- For party / group size, map counts to:
+    adults_male      = number of adult men
+    adults_female    = number of adult women
+    children_count   = number of children
+    infants          = number of infants
+    travellers_total = total number of travellers
+  Example: "3 people, 1 man and 2 adult women" ->
+    {{"adults_male": "1", "adults_female": "2", "travellers_total": "3"}}
 - Do NOT invent values. Output {{}} if nothing is present.
 
 USER MESSAGE:
@@ -561,11 +594,11 @@ def _summarize_command(command: FormFillCommand) -> str:
     parts = []
     if command.navigate_to:
         page = command.navigate_to["page"].replace("_", " ")
-        parts.append(f"opening the {page} page")
+        parts.append(f"opened the {page} page")
     if command.field_values:
         n = len(command.field_values)
         src = f" from your {command.source.replace('_', ' ')}" if command.source else ""
-        parts.append(f"filling {n} field(s){src}")
+        parts.append(f"filled {n} field(s){src}")
 
     if not parts:
         return (
